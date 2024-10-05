@@ -1,11 +1,13 @@
 use core::str;
-use std::{io::Write, path::Path};
+use std::{io::{BufReader, Cursor, Write}, path::Path};
 
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose};
 use crossterm::{cursor::MoveTo, queue};
-use image::DynamicImage;
+use image::{codecs::gif::GifDecoder, imageops::FilterType, AnimationDecoder, Delay, DynamicImage, Frame, ImageBuffer};
 use ratatui::layout::Rect;
+
+use tokio::{fs::File as TokioFile, io::AsyncReadExt};
 
 use super::image::Image;
 use crate::{CLOSE, ESCAPE, Emulator, START, adapter::Adapter};
@@ -314,17 +316,103 @@ pub(super) struct Kitty;
 
 impl Kitty {
 	pub(super) async fn image_show(path: &Path, max: Rect) -> Result<Rect> {
-		let img = Image::downscale(path, max).await?;
-		let area = Image::pixel_area((img.width(), img.height()), max);
 
-		let b1 = Self::encode(img).await?;
-		let b2 = Self::place(&area)?;
+		// check for gif mime-type
+		let mut file = TokioFile::open(path).await?;
+		let mut buf = Vec::new();
+		file.read_to_end(&mut buf).await?;
+
+		// if so, we need to collect the frames of the gif in a Vec<Dynamic_Image>
+		// then resize and encode each frame as an animation frame
+		// then, transmit them to kitty
+
+		let magic_bytes = &buf[0..6]; // Take the first 6 bytes
+		let _ascii_string: String = magic_bytes
+			.iter()
+			.map(|&byte| {
+				if byte.is_ascii() && !byte.is_ascii_control() {
+					byte as char
+				} else {
+					'.' // Replace non-printable ASCII characters with a dot
+				}
+			})
+			.collect();
+		let is_gif = magic_bytes == b"GIF89a" || magic_bytes == b"GIF87a";
+		let (mut b1, b2, area);
+		let mut first_frame_delay = 0;
+		match is_gif {
+			true => {
+				// this should be able to handle gifs that have one or more frames
+				// DynamicImage doesn't, in my understanding, maintain the gif frame data
+
+				// we don't use the img except to just get the downscaled area, there's probably a better way, not sure?
+				let img = Image::downscale(path, max).await?;
+				area = Image::pixel_area((img.width(), img.height()), max);
+
+				// only attempt to resize the frames if we need to
+				let (max_w, max_h) = Image::max_pixel(max);
+
+				let cursor = Cursor::new(buf);
+				let mut reader = BufReader::new(cursor);
+				let decoder = GifDecoder::new(&mut reader)?;
+				let d_frames = decoder.into_frames().collect_frames().unwrap();
+				let gif_frames: Vec<Frame> = if img.width() >= max_w || img.height() >= max_h {
+						d_frames.into_iter().map(|frame| {
+							// Check the length of the buffer to determine RGB8 (3 channels) or RGBA8 (4 channels)
+							let buffer = frame.buffer().clone();
+							let channels = buffer.len() / (buffer.width() as usize * buffer.height() as usize);
+							let filter_type = FilterType::Nearest;
+							match channels {
+								3 => {
+									// It's an RGB8 frame
+									let rgb_image = ImageBuffer::from_raw(buffer.width(), buffer.height(), buffer.into_raw()).unwrap();
+									let resized_image = DynamicImage::ImageRgb8(rgb_image).resize(max_w, max_h, filter_type);
+									let resized_buffer = resized_image.into_rgba8();
+									// TODO: This is odd, but the image crate can't assemble a GIF frame from parts with an RGB8 component.
+									Frame::from_parts(resized_buffer, 0, 0, frame.delay())
+								}
+								4 => {
+									// It's an RGBA8 frame
+									let rgba_image = ImageBuffer::from_raw(buffer.width(), buffer.height(), buffer.into_raw()).unwrap();
+									let resized_image = DynamicImage::ImageRgba8(rgba_image).resize(max_w, max_h, filter_type);
+									let resized_buffer = resized_image.into_rgba8();
+									Frame::from_parts(resized_buffer, 0, 0, frame.delay())
+								}
+								_ => panic!("Unexpected buffer format. It must be either RGB8 or RGBA8."),
+							}
+						}).collect()
+				}
+				else { d_frames };
+
+			    first_frame_delay = Self::delay_to_ms(gif_frames.first().unwrap().delay());
+				// b1 contains the start payload animation frames and end frame
+				b1 = Self::encode_gif(gif_frames).await?;
+				b2 = Self::place(&area)?;
+			},
+			false => {
+				// if it is not a gif we can use the original code
+				let img = Image::downscale(path, max).await?;
+				area = Image::pixel_area((img.width(), img.height()), max);
+
+				b1 = Vec::new();
+				b1.push(Self::encode(img).await?);
+				b2 = Self::place(&area)?;
+			}
+			// handle the decoding of the gif into frames
+		};
 
 		Adapter::Kitty.image_hide()?;
 		Adapter::shown_store(area);
+		let num_frames = b1.len();
 		Emulator::move_lock((area.x, area.y), |stderr| {
-			stderr.write_all(&b1)?;
+			for buf in b1 {
+				stderr.write_all(&buf)?;
+			}
 			stderr.write_all(&b2)?;
+			if is_gif && num_frames > 1 {
+				let anim_buf = Self::animate(1, first_frame_delay)?;
+				stderr.write_all(&anim_buf)?;
+			}
 			Ok(area)
 		})
 	}
@@ -388,6 +476,81 @@ impl Kitty {
 		.await?
 	}
 
+	async fn encode_gif(frames: Vec<Frame>) -> Result<Vec<Vec<u8>>> {
+		fn output_frame(raw: &[u8], format: u8, delay_ms: u32, index: usize, size: (u32, u32)) -> Result<Vec<u8>> {
+			let b64 = general_purpose::STANDARD.encode(raw).into_bytes();
+
+			let mut it = b64.chunks(4096).peekable();
+			let mut buf = Vec::with_capacity(b64.len() + it.len() * 50);
+
+			let first_gif_frame = index == 0;
+
+			if first_gif_frame {
+				if let Some(first) = it.next() {
+					write!(
+						buf,
+						"{}_Gq=2,a=T,i=1,C=1,U=1,f={},s={},v={},m={};{}{}\\{}",
+						START,
+						format,
+						size.0,
+						size.1,
+						it.peek().is_some() as u8,
+						unsafe { str::from_utf8_unchecked(first) },
+						ESCAPE,
+						CLOSE
+					)?;
+				}
+			}
+			else {
+				if let Some(first) = it.next() {
+					write!(
+						buf,
+						"{}_Gq=2,a=f,z={},i=1,m={};{}{}\\{}",
+						START,
+						delay_ms,
+						it.peek().is_some() as u8,
+						unsafe { str::from_utf8_unchecked(first) },
+						ESCAPE,
+						CLOSE
+					)?;
+				}
+			}
+			while let Some(chunk) = it.next() {
+				write!(
+					buf,
+					"{}_Gm={};{}{}\\{}",
+					START,
+					it.peek().is_some() as u8,
+					unsafe { str::from_utf8_unchecked(chunk) },
+					ESCAPE,
+					CLOSE
+				)?;
+			}
+
+			write!(buf, "{}", CLOSE)?;
+			Ok(buf)
+		}
+
+		let mut frame_buffer = Vec::new();
+
+		// populate framebuffer for entire gif
+		for (index, frame) in frames.into_iter().enumerate() {
+			let size = frame.buffer().dimensions();
+
+			let delay_ms = Self::delay_to_ms(frame.delay());
+
+			let buf = tokio::task::spawn_blocking(move || match DynamicImage::ImageRgba8(frame.buffer().clone()) {
+				DynamicImage::ImageRgba8(v) => output_frame(v.as_raw(), 32, delay_ms, index, size),
+				v => output_frame(v.into_rgb8().as_raw(), 24, delay_ms, index, size),
+			})
+			.await?;
+			if buf.is_ok() { frame_buffer.push(buf.unwrap()) }
+		};
+
+		// transmit our framebuffer
+		Ok(frame_buffer)
+	}
+
 	fn place(area: &Rect) -> Result<Vec<u8>> {
 		let mut buf = Vec::with_capacity(area.width as usize * area.height as usize * 3 + 50);
 		for y in 0..area.height {
@@ -400,5 +563,34 @@ impl Kitty {
 			write!(buf, "\x1b[0m")?;
 		}
 		Ok(buf)
+	}
+
+	fn animate(id: u32, first_frame_delay: u32) -> Result<Vec<u8>> {
+		let mut buf = Vec::with_capacity(50);
+		write!(
+			buf,
+			"{}_Gq=2,a=a,i={},r=1,z={}{}\\{}", // starts the animation for id=1
+			START,
+			id,
+			first_frame_delay,
+			ESCAPE,
+			CLOSE
+		)?;
+		write!(
+			buf,
+			// TODO: config values for looping (v)
+			"{}_Gq=2,a=a,s=3,i={},v=1{}\\{}", // starts the animation for id=1
+			START,
+			id,
+			ESCAPE,
+			CLOSE
+		)?;
+		write!(buf, "{}", CLOSE)?;
+		Ok(buf)
+	}
+
+	fn delay_to_ms(delay: Delay) -> u32 {
+		let (num, denom) = delay.numer_denom_ms();
+		if denom == 0 { 0 } else { num / denom }
 	}
 }
